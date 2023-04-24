@@ -17,6 +17,8 @@
   },
   "homepage": "https://github.com/MelvinW976/AutoScale-Citus#readme",
   "dependencies": {
+    "@azure/arm-cosmosdb": "^15.3.0",
+    "azure-functions-core-tools": "^4.0.5095",
     "express": "^4.18.2"
   }
 }
