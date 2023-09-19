@@ -1,109 +1,99 @@
 #include "postgres.h"
 #include "fmgr.h"
+#include "executor/spi.h"
 #include "utils/builtins.h"
-#include "access/hash.h"
-#include "catalog/pg_type.h"
-#include "access/htup_details.h"
-#include "utils/syscache.h"
-#include "catalog/pg_class.h"
-#include "catalog/pg_namespace.h"
 
 PG_MODULE_MAGIC;
 
-PG_FUNCTION_INFO_V1(turn_distributed_table);
-PG_FUNCTION_INFO_V1(create_shards);
+PG_FUNCTION_INFO_V1(distribute_table_by_hash);
 
-// Define the structure to store shard information
-typedef struct ShardInfo
+static void create_partition(char *partition_name, char *table_name);
+static int calculate_hash_value(Datum distribution_column);
+static char *get_partition_name(char *table_name, int hash_value);
+
+void _PG_init(void)
 {
-    Oid shard_oid; // Unique identifier for the shard
-    int node_id;   // Node where the shard resides
-    Datum range_start; // Start of the shard's range
-    Datum range_end;   // End of the shard's range
-} ShardInfo;
+    if (SPI_connect() != SPI_OK_CONNECT)
+        elog(ERROR, "Failed to connect to SPI");
+}
 
-// Function to turn a table into a distributed table
-Datum turn_distributed_table(PG_FUNCTION_ARGS)
+Datum distribute_table_by_hash(PG_FUNCTION_ARGS)
 {
-    Oid table_oid = PG_GETARG_OID(0);
-    int num_nodes = PG_GETARG_INT32(1); // Number of nodes in the cluster
-    char *dist_column_name = text_to_cstring(PG_GETARG_TEXT_P(2)); // Distribution column name
+    text *table_name_text = PG_GETARG_TEXT_P(0);
+    text *distribution_column_text = PG_GETARG_TEXT_P(1);
 
-    // Here, you should implement the logic to distribute the table
-    // among nodes and store the shard information in a metadata table.
-    // This involves creating shards, mapping them to nodes, and updating
-    // metadata accordingly.
+    char *table_name = text_to_cstring(table_name_text);
+    char *distribution_column_name = text_to_cstring(distribution_column_text);
 
-    // Example code (simplified):
-    for (int i = 0; i < num_nodes; i++)
+    // Prepare SQL to get the rows from the original table
+    char select_sql[256];
+    snprintf(select_sql, sizeof(select_sql), "SELECT * FROM %s", table_name);
+
+    // Execute the query to get all rows
+    if (SPI_exec(select_sql, 0) != SPI_OK_SELECT)
+        elog(ERROR, "Failed to select data from table: %s", table_name);
+
+    // Process each row and distribute it to the appropriate partition
+    for (int i = 0; i < SPI_processed; i++)
     {
-        // Create a shard and assign it to a node
-        ShardInfo shard;
-        shard.shard_oid = generate_unique_shard_id();
-        shard.node_id = i;
+        HeapTuple tuple = SPI_tuptable->vals[i];
+        TupleDesc tupdesc = SPI_tuptable->tupdesc;
+        Datum distribution_column_value;
+        bool isnull;
 
-        // Determine the shard's range based on the distribution column
-        shard.range_start = calculate_range_start(i, num_nodes);
-        shard.range_end = calculate_range_end(i, num_nodes);
+        // Extract the value of the distribution column from the current row
+        distribution_column_value = heap_getattr(tuple, tupdesc->natts, tupdesc, &isnull);
 
-        // Store shard information in metadata table
-        store_shard_metadata(table_oid, shard);
+        if (!isnull)
+        {
+            // Calculate the hash value of the distribution column
+            int hash_value = calculate_hash_value(distribution_column_value);
+
+            // Get the partition name based on the hash value
+            char *partition_name = get_partition_name(table_name, hash_value);
+
+            // Prepare SQL to insert the row into the partition
+            char insert_sql[256];
+            snprintf(insert_sql, sizeof(insert_sql), "INSERT INTO %s VALUES ($1)", partition_name);
+
+            // Execute the insert query
+            if (SPI_execp(insert_sql, &distribution_column_value, NULL, 0) != SPI_OK_INSERT)
+                elog(ERROR, "Failed to insert row into partition: %s", partition_name);
+        }
     }
 
-    PG_RETURN_VOID();
+    // Cleanup SPI resources
+    SPI_finish();
+
+    PG_RETURN_NULL();
 }
 
-// Function to create shards for a table on worker nodes
-Datum create_shards(PG_FUNCTION_ARGS)
+static void create_partition(char *partition_name, char *table_name)
 {
-    Oid table_oid = PG_GETARG_OID(0);
-    int num_shards = PG_GETARG_INT32(1); // Number of shards to create
+    // Prepare SQL to create a new partition table
+    char create_partition_sql[256];
+    snprintf(create_partition_sql, sizeof(create_partition_sql),
+             "CREATE TABLE %s (LIKE %s INCLUDING ALL) INHERITS (%s)",
+             partition_name, table_name, table_name);
 
-    // Here, you should implement the logic to create shards
-    // for the specified table on worker nodes.
-
-    // Example code (simplified):
-    for (int i = 0; i < num_shards; i++)
-    {
-        // Create a shard and assign it to a worker node
-        ShardInfo shard;
-        shard.shard_oid = generate_unique_shard_id();
-        shard.node_id = get_next_available_worker_node();
-
-        // Determine the shard's range based on the distribution column
-        shard.range_start = calculate_range_start(i, num_shards);
-        shard.range_end = calculate_range_end(i, num_shards);
-
-        // Create the shard on the worker node (e.g., using FDWs or custom logic)
-
-        // Store shard information in metadata table
-        store_shard_metadata(table_oid, shard);
-    }
-
-    PG_RETURN_VOID();
+    // Execute the create table query
+    if (SPI_exec(create_partition_sql, 0) != SPI_OK_SELECT)
+        elog(ERROR, "Failed to create partition table: %s", partition_name);
 }
 
-// Utility function to calculate the shard's range start based on the node id and total nodes
-Datum calculate_range_start(int node_id, int num_nodes)
+static int calculate_hash_value(Datum distribution_column)
 {
-    // You should implement the logic to calculate the range start based on your distribution column.
-    // This is just a placeholder.
-    return Int32GetDatum(node_id);
+    // Implement logic to calculate the hash value of the distribution column.
+    // You can use hash functions available in PostgreSQL or a custom hash function.
+    // For simplicity, we'll use a simple hash function here.
+    return DatumGetInt32(distribution_column);
 }
 
-// Utility function to calculate the shard's range end based on the node id and total nodes
-Datum calculate_range_end(int node_id, int num_nodes)
+static char *get_partition_name(char *table_name, int hash_value)
 {
-    // You should implement the logic to calculate the range end based on your distribution column.
-    // This is just a placeholder.
-    return Int32GetDatum(node_id + 1);
+    // Implement logic to generate the name of the partition based on the hash value.
+    // You can use a naming convention that includes the table name and hash value.
+    char partition_name[256];
+    snprintf(partition_name, sizeof(partition_name), "%s_partition_%d", table_name, hash_value);
+    return pstrdup(partition_name);
 }
-
-// Utility function to store shard metadata in a metadata table
-void store_shard_metadata(Oid table_oid, ShardInfo shard)
-{
-    // You should implement the logic to store shard metadata in a table of your choice.
-    // This is just a placeholder.
-    elog(NOTICE, "Storing shard metadata for shard OID %u on node %d", shard.shard_oid, shard.node_id);
-}
-
