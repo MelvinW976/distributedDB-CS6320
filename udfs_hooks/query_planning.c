@@ -63,12 +63,3 @@ List *determine_shards_to_query(const char *query_str, const char *distribution_
     return shards_to_query;
 }
 
-// Utility function to execute a query on a specific shard
-void execute_query_on_shard(const char *query_str, int shard_id)
-{
-    // Implement the logic to execute the query on the specified shard.
-    // This can involve using FDWs, custom connectors, or other mechanisms.
-
-    // For simplicity, we'll just log the query and shard_id here.
-    elog(NOTICE, "Executing query on shard %d: %s", shard_id, query_str);
-}
